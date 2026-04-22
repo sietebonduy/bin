@@ -1,0 +1,26 @@
+#!/usr/bin/env ruby
+
+# frozen_string_literal: true
+
+input = if ARGV.any?
+          ARGV.join(' ')
+        else
+          $stdin.read
+        end
+
+input = input.strip
+if input.empty?
+  warn "Usage: bn <branch name>\nPass input via args or stdin."
+  exit 1
+end
+
+branch = input
+         .downcase
+         .gsub(/[^[:alnum:]\s-]/, '')
+         .strip
+         .gsub(/\s+/, '-')
+         .gsub(/-+/, '-')
+         .gsub(/^-|-$/, '')
+
+IO.popen('pbcopy', 'w') { |f| f << branch }
+puts "Branch was copied to clipboard!\n#{branch}"

@@ -1,0 +1,129 @@
+#!/usr/bin/env ruby
+
+require 'dotenv'
+require 'net/http'
+require 'json'
+require 'open3'
+
+def usage
+  <<~USAGE
+    Usage:
+      cm <ticket> <message...>
+      cm -df
+
+    Examples:
+      cm 123 Fix login redirect
+      git diff --staged | cm -df
+  USAGE
+end
+
+def system_prompt
+  <<~SYSTEM
+    You are a senior software engineer.
+    Your task is to write a Git commit message.
+
+    Rules:
+    - Output ONLY the final commit message
+    - No explanations, no bullet points, no markdown
+    - One line only
+    - Use normal sentence case (not snake_case, not kebab-case)
+    - Do NOT lowercase everything
+    - Be concise and meaningful (max 1–2 short sentences)
+  SYSTEM
+end
+
+def user_prompt(diff_output)
+  <<~USER
+    Based on the following staged git diff, write a concise and meaningful commit message.
+
+    Git diff: #{diff_output}
+  USER
+end
+
+def branch_number
+  branch_name = `git rev-parse --abbrev-ref HEAD`.strip
+
+  branch_name[/\d+/]
+end
+
+# meta-llama/Llama-3.1-8B-Instruct:cerebras
+def get_ai_assistance(messages)
+  token = ENV['HUGGING_FACE_API_TOKEN'].to_s.strip
+  if token.empty?
+    warn 'Missing HUGGING_FACE_API_TOKEN.'
+    exit 1
+  end
+
+  uri = URI('https://router.huggingface.co/v1/chat/completions')
+  req = Net::HTTP::Post.new(uri)
+  req['Authorization'] = "Bearer #{token}"
+  req['Content-Type'] = 'application/json'
+  req.body = { model: 'zai-org/GLM-4.7:novita', messages: messages, stream: false }.to_json
+  res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
+
+  unless res.is_a?(Net::HTTPSuccess)
+    warn "AI request failed (#{res.code}): #{res.body.to_s.strip}"
+    exit 1
+  end
+
+  result = JSON.parse(res.body)
+  result.dig('choices', 0, 'message', 'content') || ''
+end
+
+def normalize_commit_message(message)
+  message.to_s
+    .gsub(/\s+/, ' ')
+    .strip
+end
+
+def proc_result(commit_message)
+  IO.popen('pbcopy', 'w') { |f| f << commit_message }
+  puts "Commit Message was copied to clipboard!\n#{commit_message}"
+end
+
+Dotenv.load(File.join(__dir__, '.env'))
+
+args = ARGV.dup
+
+if args.empty? || args.include?('-h') || args.include?('--help')
+  puts usage
+  exit(args.empty? ? 1 : 0)
+end
+
+result = if args.first == '-df'
+           diff_output, = Open3.capture2('git', 'diff', '--staged')
+
+           if diff_output.strip.empty?
+             puts 'No staged changes found.'
+             exit 1
+           end
+
+           messages = [
+             { role: 'system', content: system_prompt },
+             { role: 'user', content: user_prompt(diff_output) }
+           ]
+
+           bn = branch_number
+           message = ''
+           message += "[#{bn}] " unless bn.nil? || bn.empty?
+           message + get_ai_assistance(messages)
+         else
+           message = args.filter { |value| value != '' }
+           if message.empty?
+             puts usage
+             exit 1
+           end
+
+           unless message[0].start_with?('[') && message[0].end_with?(']')
+             message[0] = "[#{message[0]}]"
+           end
+           message.join(' ')
+         end
+
+result = normalize_commit_message(result)
+if result.empty?
+  warn 'Empty commit message.'
+  exit 1
+end
+
+proc_result(result)

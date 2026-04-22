@@ -1,0 +1,112 @@
+#!/usr/bin/env ruby
+
+require 'dotenv'
+require 'net/http'
+require 'json'
+require 'open3'
+
+Dotenv.load(File.join(__dir__, '.env'))
+
+def usage
+  <<~USAGE
+    Usage:
+      ct
+      ct <count>
+      ct -n <count>
+
+    Generate a concise changelog from recent commits.
+  USAGE
+end
+
+def system_prompt
+  <<~SYSTEM
+    You are a senior software engineer writing release notes.
+    Produce a concise changelog in two sections:
+    1) English
+    2) Russian
+
+    Rules:
+    - Keep each section 3-8 bullet points.
+    - Use clear, user-facing language.
+    - Do not mention commit hashes.
+    - Avoid repeating the same item.
+  SYSTEM
+end
+
+def user_prompt(log_output)
+  <<~USER
+    Based on the following git commit log, write a concise changelog.
+
+    Commit log:
+    #{log_output}
+  USER
+end
+
+def get_ai_assistance(messages)
+  token = ENV['HUGGING_FACE_API_TOKEN'].to_s.strip
+  if token.empty?
+    warn 'Missing HUGGING_FACE_API_TOKEN.'
+    exit 1
+  end
+
+  uri = URI('https://router.huggingface.co/v1/chat/completions')
+  req = Net::HTTP::Post.new(uri)
+  req['Authorization'] = "Bearer #{token}"
+  req['Content-Type'] = 'application/json'
+  req.body = { model: 'zai-org/GLM-4.7:novita', messages: messages, stream: false }.to_json
+  res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
+
+  unless res.is_a?(Net::HTTPSuccess)
+    warn "AI request failed (#{res.code}): #{res.body.to_s.strip}"
+    exit 1
+  end
+
+  result = JSON.parse(res.body)
+  result.dig('choices', 0, 'message', 'content') || ''
+end
+
+def proc_result(changelog)
+  IO.popen('pbcopy', 'w') { |f| f << changelog }
+  puts "Changelog was copied to clipboard!\n#{changelog}"
+end
+
+def parse_count(args)
+  return 10 if args.empty?
+
+  return args[0].to_i if args.length == 1 && args[0] =~ /^\d+$/
+
+  return args[1].to_i if args.length == 2 && args[0] == '-n' && args[1] =~ /^\d+$/
+
+  nil
+end
+
+args = ARGV.dup
+if args.include?('-h') || args.include?('--help')
+  puts usage
+  exit 0
+end
+
+count = parse_count(args)
+if count.nil? || count <= 0
+  puts usage
+  exit 1
+end
+
+log_output, = Open3.capture2('git', 'log', "-#{count}", '--pretty=format:%h %s')
+if log_output.strip.empty?
+  puts 'No commits found.'
+  exit 1
+end
+
+messages = [
+  { role: 'system', content: system_prompt },
+  { role: 'user', content: user_prompt(log_output) }
+]
+
+changelog = get_ai_assistance(messages).to_s.strip
+if changelog.empty?
+  warn 'Empty changelog response.'
+  exit 1
+end
+
+proc_result(changelog)

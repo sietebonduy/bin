@@ -1,0 +1,95 @@
+#!/usr/bin/env ruby
+
+require 'dotenv'
+require 'net/http'
+require 'json'
+require 'open3'
+
+Dotenv.load(File.join(__dir__, '.env'))
+
+def usage
+  <<~USAGE
+    Usage:
+      cr
+      cr -df
+
+    AI review for staged changes.
+  USAGE
+end
+
+def system_prompt
+  <<~SYSTEM
+    You are a senior software engineer performing a code review.
+    Review the staged diff and provide:
+    - Summary (1-2 sentences)
+    - Issues (only if real, prioritize correctness/bugs)
+    - Suggestions (optional improvements)
+    Keep it concise and practical.
+  SYSTEM
+end
+
+def user_prompt(diff_output)
+  <<~USER
+    Review the following staged git diff:
+
+    #{diff_output}
+  USER
+end
+
+def get_ai_assistance(messages)
+  token = ENV['HUGGING_FACE_API_TOKEN'].to_s.strip
+  if token.empty?
+    warn 'Missing HUGGING_FACE_API_TOKEN.'
+    exit 1
+  end
+
+  uri = URI('https://router.huggingface.co/v1/chat/completions')
+  req = Net::HTTP::Post.new(uri)
+  req['Authorization'] = "Bearer #{token}"
+  req['Content-Type'] = 'application/json'
+  req.body = { model: 'zai-org/GLM-4.7:novita', messages: messages, stream: false }.to_json
+  res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
+
+  unless res.is_a?(Net::HTTPSuccess)
+    warn "AI request failed (#{res.code}): #{res.body.to_s.strip}"
+    exit 1
+  end
+
+  result = JSON.parse(res.body)
+  result.dig('choices', 0, 'message', 'content') || ''
+end
+
+def proc_result(review)
+  IO.popen('pbcopy', 'w') { |f| f << review }
+  puts "AI review was copied to clipboard!\n#{review}"
+end
+
+args = ARGV.dup
+if args.include?('-h') || args.include?('--help')
+  puts usage
+  exit 0
+end
+
+if args.any? && args.first != '-df'
+  puts usage
+  exit 1
+end
+
+diff_output, = Open3.capture2('git', 'diff', '--staged')
+if diff_output.strip.empty?
+  puts 'No staged changes found.'
+  exit 1
+end
+
+messages = [
+  { role: 'system', content: system_prompt },
+  { role: 'user', content: user_prompt(diff_output) }
+]
+
+review = get_ai_assistance(messages).to_s.strip
+if review.empty?
+  warn 'Empty review response.'
+  exit 1
+end
+
+proc_result(review)
